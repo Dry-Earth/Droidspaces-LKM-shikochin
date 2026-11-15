@@ -1,5 +1,11 @@
 ifneq ($(KERNELRELEASE),)
 include $(src)/vendor/kallrecon/deps.mk
+ifeq ($(HUMMER),1)
+# Exact vendor-kernel build: accept only this device's complete uname -r.
+ccflags-y += -include $(src)/src/ds-hummer.h
+HUMMER_RELEASE ?= 6.6.144-4k-g01ee97578159
+ccflags-y += -DDS_HUMMER_RELEASE=\"$(HUMMER_RELEASE)\"
+endif
 ifeq ($(TARGET),namespace)
 PORT_DIR ?= src/port
 obj-m := droidspaces_ns.o

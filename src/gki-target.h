@@ -17,6 +17,11 @@ static bool ds_gki_target_supported(void)
 
     if (of_machine_is_compatible("linux,dummy-virt") && !strcmp(release, UTS_RELEASE))
         return true;
+#ifdef DS_HUMMER_RELEASE
+    /* Exact vendor-kernel profile: built against this device's own KDIR. */
+    if (!strcmp(release, DS_HUMMER_RELEASE))
+        return gki;
+#endif
     if (!gki || strncmp(release, DS_GKI_VERSION ".", sizeof(DS_GKI_VERSION)))
         return false;
     patch = release + sizeof(DS_GKI_VERSION);

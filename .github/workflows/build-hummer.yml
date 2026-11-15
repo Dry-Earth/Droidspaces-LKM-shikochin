@@ -1,0 +1,314 @@
+name: "[hummer] Build from OTA"
+
+# Build the upstream Droidspaces-LKM src/port66 payload against one exact
+# OnePlus Ace 5 Pro (hummer) LineageOS 24 kernel, then package it with the
+# upstream KernelSU template + pre-load ABI checker.
+#
+# The only inputs are the OTA boot.img and its build-manifest.xml.
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: 'OTA boot.img URL'
+        required: true
+        type: string
+        default: 'https://mirrorbits.lineageos.org/full/hummer/20261113/boot.img'
+      manifest_url:
+        description: 'OTA build-manifest.xml URL'
+        required: true
+        type: string
+        default: 'https://mirrorbits.lineageos.org/full/hummer/20261113/build-manifest.xml'
+      publish_release:
+        description: '构建成功后发布 Release'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
+  MODULES_REPO: LineageOS/android_kernel_oneplus_sm8750-modules
+  MAGISKBOOT_URL_CACHED: https://github.com/Dry-Earth/LKM-Droidspaces/releases/download/test-assets/libmagiskboot-x86_64.so
+  MAGISK_APK_URL: https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
+  DDK_IMAGE: ghcr.io/ylarod/ddk-min:android15-6.6-20260313
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Download and parse build-manifest.xml
+        run: |
+          set -eux
+          curl -fL --retry 3 --retry-all-errors --connect-timeout 20 -A "Mozilla/5.0" \
+            -o manifest.xml "${{ inputs.manifest_url }}"
+          python3 ci/parse-manifest.py manifest.xml | tee metadata.env
+          cat metadata.env >> "$GITHUB_ENV"
+
+      - name: Download boot.img and magiskboot
+        run: |
+          set -eux
+          mkdir -p bootwork
+          curl -fL --retry 3 --retry-all-errors --connect-timeout 20 -A "Mozilla/5.0" \
+            -o bootwork/stock-boot.img "${{ inputs.boot_img_url }}"
+          stat -c 'boot.img size=%s' bootwork/stock-boot.img
+          sha256sum bootwork/stock-boot.img | tee bootwork/boot.sha256
+
+          if curl -fL --retry 3 --retry-all-errors -o bootwork/magiskboot "$MAGISKBOOT_URL_CACHED"; then
+            chmod +x bootwork/magiskboot
+          else
+            curl -fL --retry 3 --retry-all-errors -o Magisk.apk "$MAGISK_APK_URL"
+            unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d magisk
+            install -m 755 magisk/lib/x86_64/libmagiskboot.so bootwork/magiskboot
+          fi
+          chmod +x bootwork/magiskboot
+
+      - name: Clone kernel and modules at manifest revisions
+        run: |
+          set -eux
+          for repo_sha in "kernel:${KERNEL_REPO}:${KERNEL_SHA}" "sm8750-modules:${MODULES_REPO}:${MODULES_SHA}"; do
+            dir=${repo_sha%%:*}
+            rest=${repo_sha#*:}
+            repo=${rest%%:*}
+            sha=${rest##*:}
+            mkdir -p "$dir"
+            cd "$dir"
+            git init -q
+            git remote add origin "https://github.com/${repo}.git"
+            if ! git fetch --depth 1 --no-tags origin "$sha"; then
+              git fetch --no-tags --depth 200 origin || true
+            fi
+            git checkout -q "$sha" 2>/dev/null || git checkout -q FETCH_HEAD
+            test "$(git rev-parse HEAD)" = "$sha"
+            cd ..
+          done
+          ln -sfn kernel sm8750
+
+      - name: Extract config / release / compiler from boot.img
+        run: |
+          set -eux
+          mkdir -p build-config
+          cd bootwork
+          ./magiskboot unpack stock-boot.img
+          ls -lh kernel
+
+          sh ../kernel/scripts/extract-ikconfig kernel > ../build-config/stock.config
+          test "$(grep -c '^CONFIG_' ../build-config/stock.config)" -gt 1000
+          grep -q '^CONFIG_ARM64_4K_PAGES=y' ../build-config/stock.config
+          grep -q '^CONFIG_DEBUG_INFO_BTF=y' ../build-config/stock.config
+
+          rel=$(strings kernel | grep -m1 'Linux version ' | sed -n 's/.*Linux version \([^ ]*\).*/\1/p')
+          clang_raw=$(strings kernel | grep -m1 'based on r[0-9]' | sed -n 's/.*based on \(r[0-9]*\).*/\1/p')
+          test -n "$rel"
+          test -n "$clang_raw"
+          echo "EXPECTED_RELEASE=$rel" >> "$GITHUB_ENV"
+          echo "EXPECTED_CLANG=$clang_raw" >> "$GITHUB_ENV"
+          echo "CLANG_REV=clang-$clang_raw" >> "$GITHUB_ENV"
+          echo "release=$rel clang=$clang_raw"
+
+      - name: Restore clang cache
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: clang-stock
+          key: hummer-clang-${{ hashFiles('metadata.env') }}-${{ env.CLANG_REV }}-v1
+
+      - name: Download matching stock clang
+        run: |
+          set -eux
+          mkdir -p clang-stock
+          if [ -x clang-stock/bin/clang ] && clang-stock/bin/clang --version | grep -q "$EXPECTED_CLANG"; then
+            echo "==> clang cache hit"
+            exit 0
+          fi
+          base="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
+          urls="
+            ${base}/${CLANG_PROJECT_SHA}/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-release/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-qpr1-release/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-qpr2-release/${CLANG_REV}.tar.gz
+          "
+          ok=0
+          for attempt in 1 2 3; do
+            for u in $urls; do
+              echo "==> try $u (attempt $attempt)"
+              rm -rf clang-stock /tmp/clang.tar.gz
+              mkdir -p clang-stock
+              if curl -fL --retry 5 --retry-all-errors --retry-delay 2 \
+                   --connect-timeout 20 -o /tmp/clang.tar.gz "$u" &&
+                 tar -xzf /tmp/clang.tar.gz -C clang-stock; then
+                ok=1
+                break 2
+              fi
+            done
+          done
+          test "$ok" = "1"
+          test -x clang-stock/bin/clang
+          clang-stock/bin/clang --version | grep -q "$EXPECTED_CLANG"
+
+      - name: Save clang cache
+        if: ${{ steps.clang-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: clang-stock
+          key: hummer-clang-${{ hashFiles('metadata.env') }}-${{ env.CLANG_REV }}-v1
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: hummer-ccache-${{ hashFiles('metadata.env', 'build-config/stock.config') }}
+          restore-keys: |
+            hummer-ccache-
+
+      - name: Pull DDK toolchain
+        run: docker pull "$DDK_IMAGE"
+
+      - name: Build exact KDIR
+        run: |
+          set -eux
+          mkdir -p .ccache
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$PWD/.ccache:/ccache" \
+            -w /work/kernel \
+            -e KERNELRELEASE="$EXPECTED_RELEASE" \
+            -e USE_STOCK_CLANG=1 \
+            -e EXPECTED_CLANG \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_BASEDIR=/work/kernel \
+            -e CCACHE_COMPRESS=1 \
+            -e CCACHE_MAXSIZE=5G \
+            "$DDK_IMAGE" \
+            bash /work/ci/build-kdir.sh
+
+      - name: Build hummer src/port66 payload and extract BTF
+        run: |
+          set -eux
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e ROOT=/work \
+            -e KDIR=/work/kernel/out \
+            -e OUT=/work/out/hummer \
+            -e HUMMER_RELEASE="$EXPECTED_RELEASE" \
+            -e JOBS="$(nproc)" \
+            "$DDK_IMAGE" \
+            bash /work/ci/build-hummer.sh
+
+      - name: Generate hummer ABI constraints
+        run: |
+          set -eux
+          python3 scripts/abi/make-constraints.py \
+            --module out/hummer/module.btf \
+            --kernel out/hummer/kernel.btf \
+            --imports out/hummer/imports.txt \
+            --symbols out/hummer/symbols.txt \
+            --port src/port66 \
+            --output out/hummer/hummer-6.6.abi
+          python3 - <<'PY'
+          import json
+          audit = json.load(open('out/hummer/hummer-6.6.audit.json'))
+          print(audit)
+          assert audit['checked_hook_prototypes'] >= 20, audit
+          assert audit['resolved_imports'] >= 100, audit
+          PY
+
+      - name: Build pre-load ABI checker
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Werror \
+            src/abi/check.c -o out/hummer/abi-check
+          file out/hummer/abi-check
+
+      - name: Package upstream-format KernelSU zip
+        run: |
+          set -eux
+          python3 scripts/package-hummer.py \
+            --payload out/hummer/droidspaces_ns.ko \
+            --abi out/hummer/hummer-6.6.abi \
+            --abi-check out/hummer/abi-check \
+            --output dist \
+            --release "$EXPECTED_RELEASE" \
+            --kernel-sha "$KERNEL_SHA" \
+            --config-sha "$(sha256sum build-config/stock.config | awk '{print $1}')"
+          python3 - <<'PY'
+          import glob, zipfile
+          z = zipfile.ZipFile(glob.glob('dist/*.zip')[0])
+          print('\n'.join(z.namelist()))
+          print(z.read('kernel/manifest.tsv').decode())
+          PY
+          sha256sum dist/*
+
+      - name: Write build info
+        run: |
+          set -eux
+          {
+            echo "device:        OnePlus Ace 5 Pro (hummer)"
+            echo "manifest:      ${{ inputs.manifest_url }}"
+            echo "boot img:      ${{ inputs.boot_img_url }}"
+            echo "boot sha256:   $(awk '{print $1}' bootwork/boot.sha256)"
+            echo "kernel:        ${KERNEL_REPO} @ ${KERNEL_SHA}"
+            echo "modules:       ${MODULES_REPO} @ ${MODULES_SHA}"
+            echo "clang project: ${CLANG_PROJECT_SHA:-}"
+            echo "release:       ${EXPECTED_RELEASE}"
+            echo "source:        Shikochin/Droidspaces-LKM src/port66 (upstream loader)"
+            echo "clang:         $(clang-stock/bin/clang --version | head -n1)"
+            echo "abi audit:"
+            cat out/hummer/hummer-6.6.audit.json
+            echo
+            echo "zip sha256:"
+            sha256sum dist/*.zip
+          } > build-info-hummer.txt
+          cat build-info-hummer.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidspaces-lkm-hummer-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            dist/*.zip
+            dist/*.ko
+            dist/SHA256SUMS
+            out/hummer/hummer-6.6.abi
+            out/hummer/hummer-6.6.audit.json
+            build-info-hummer.txt
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          tag="hummer-${GITHUB_RUN_ID}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.zip dist/*.ko dist/SHA256SUMS build-info-hummer.txt \
+              -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/*.zip dist/*.ko dist/SHA256SUMS build-info-hummer.txt \
+              -R "$GITHUB_REPOSITORY" \
+              --title "Droidspaces LKM hummer ${EXPECTED_RELEASE} (${GITHUB_RUN_ID})" \
+              --notes-file build-info-hummer.txt
+          fi
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url -q .url

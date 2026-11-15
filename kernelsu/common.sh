@@ -34,8 +34,22 @@ ds_target_supported() {
     ds_family=$(printf '%s\n' "$ds_release" | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\)\.[0-9][0-9]*-android[0-9][0-9]*-.*/\1/p')
     ds_android=$(printf '%s\n' "$ds_release" | sed -n 's/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-\(android[0-9][0-9]*\)-.*/\1/p')
     DS_REASON="无法从内核版本识别 GKI KMI：$ds_release"
-    [ -n "$ds_family" ] && [ -n "$ds_android" ] || return 1
-    DS_KMI="$ds_android-$ds_family"
+    if [ -z "$ds_family" ] || [ -z "$ds_android" ]; then
+        # Vendor 6.6 4 KiB-page kernel (hummer / SM8750, LineageOS 24).
+        # The package pins the complete release; the ABI is still checked
+        # below against constraints generated from that exact build.
+        case "$ds_release" in
+            6.6.*-4k-g*) DS_KMI='hummer-6.6' ;;
+            *) return 1 ;;
+        esac
+        if [ -s "$MODDIR/kernel/target-release.txt" ] &&
+            [ "$(cat "$MODDIR/kernel/target-release.txt")" != "$ds_release" ]; then
+            DS_REASON="本包只支持 $(cat "$MODDIR/kernel/target-release.txt")"
+            return 1
+        fi
+    else
+        DS_KMI="$ds_android-$ds_family"
+    fi
     DS_REASON="安装包未包含匹配的 KMI：$DS_KMI"
     [ -r "$MODDIR/kernel/manifest.tsv" ] || { DS_REASON='缺少 KMI 清单。'; return 1; }
     ds_row=$(awk -F '|' -v kmi="$DS_KMI" '$1 == kmi { row=$0; count++ } END { if (count==1) print row; else exit 1 }' "$MODDIR/kernel/manifest.tsv") || return 1
